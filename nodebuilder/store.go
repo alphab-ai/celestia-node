@@ -5,22 +5,21 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/cosmos/cosmos-sdk/crypto/keyring"
-	"github.com/dgraph-io/badger/v4/options"
 	"github.com/gofrs/flock"
 	"github.com/ipfs/go-datastore"
-	dsbadger "github.com/ipfs/go-ds-badger4"
+	dspebble "github.com/ipfs/go-ds-pebble"
+	"github.com/cockroachdb/pebble"
 	"github.com/mitchellh/go-homedir"
 
 	"github.com/celestiaorg/celestia-node/libs/keystore"
 	nodemod "github.com/celestiaorg/celestia-node/nodebuilder/node"
 	"github.com/celestiaorg/celestia-node/nodebuilder/p2p"
-	"github.com/celestiaorg/celestia-node/share"
+	"github.com/cockroachdb/pebble/bloom"
+	"runtime"
 )
 
 var (
@@ -127,10 +126,86 @@ func (f *fsStore) Datastore() (datastore.Batching, error) {
 		return f.data, nil
 	}
 
-	cfg := constraintBadgerConfig()
-	ds, err := dsbadger.NewDatastore(dataPath(f.path), cfg)
+	// cache := pebble.NewCache(1026)
+	// // compress := pebble.ZstdCompression
+	// filter := bloom.FilterPolicy(10)
+	// lopts := make([]pebble.LevelOptions, 0)
+	// opt := pebble.LevelOptions{
+	// 		// Compression:    compress,
+	// 		// BlockSize:      cfg.BlockSize,
+	// 		// TargetFileSize: int64(cfg.TargetFileSizeBase),
+	// 		FilterPolicy:   filter,
+	// 	}
+
+	// opt.EnsureDefaults()
+	// lopts = append(lopts, opt)
+
+	// opts := &pebble.Options{
+	// 	MaxManifestFileSize: 64 << 20,
+	// 	MemTableSize:        64 << 20,
+	// 	Cache:               cache, // 1gb
+	// 	Levels: lopts,
+	// 	// Compression: compress,
+	// 	// MaxConcurrentCompactions:    3,
+	// 	// MemTableStopWritesThreshold: 4,
+	// }
+
+
+	cache := 512
+	handles := 4096
+	memTableLimit := 2
+	memTableSize := cache * 1024 * 1024 / 2 / memTableLimit
+	// compress := pebble.ZstdCompression //
+	opt := &pebble.Options{
+		// Pebble has a single combined cache area and the write
+		// buffers are taken from this too. Assign all available
+		// memory allowance for cache.
+		Cache:        pebble.NewCache(int64(cache * 1024 * 1024)),
+		MaxOpenFiles: handles,
+
+		// The size of memory table(as well as the write buffer).
+		// Note, there may have more than two memory tables in the system.
+		MemTableSize: uint64(memTableSize),
+
+		// MemTableStopWritesThreshold places a hard limit on the size
+		// of the existent MemTables(including the frozen one).
+		// Note, this must be the number of tables not the size of all memtables
+		// according to https://github.com/cockroachdb/pebble/blob/master/options.go#L738-L742
+		// and to https://github.com/cockroachdb/pebble/blob/master/db.go#L1892-L1903.
+		MemTableStopWritesThreshold: memTableLimit,
+
+		// The default compaction concurrency(1 thread),
+		// Here use all available CPUs for faster compaction.
+		MaxConcurrentCompactions: runtime.NumCPU,
+
+		// Per-level options. Options for at least one level must be specified. The
+		// options for the last level are used for all subsequent levels.
+		Levels: []pebble.LevelOptions{
+			{TargetFileSize: 2 * 1024 * 1024, FilterPolicy: bloom.FilterPolicy(10)},
+			{TargetFileSize: 2 * 1024 * 1024, FilterPolicy: bloom.FilterPolicy(10)},
+			{TargetFileSize: 2 * 1024 * 1024, FilterPolicy: bloom.FilterPolicy(10)},
+			{TargetFileSize: 2 * 1024 * 1024, FilterPolicy: bloom.FilterPolicy(10)},
+			{TargetFileSize: 2 * 1024 * 1024, FilterPolicy: bloom.FilterPolicy(10)},
+			{TargetFileSize: 2 * 1024 * 1024, FilterPolicy: bloom.FilterPolicy(10)},
+			{TargetFileSize: 2 * 1024 * 1024, FilterPolicy: bloom.FilterPolicy(10)},
+			// {Compression: compress},
+		},
+		// ReadOnly: readonly,
+		// EventListener: &pebble.EventListener{
+		// 	CompactionBegin: db.onCompactionBegin,
+		// 	CompactionEnd:   db.onCompactionEnd,
+		// 	WriteStallBegin: db.onWriteStallBegin,
+		// 	WriteStallEnd:   db.onWriteStallEnd,
+		// },
+		// Logger: panicLogger{}, // TODO(karalabe): Delete when this is upstreamed in Pebble
+	}
+	// Disable seek compaction explicitly. Check https://github.com/ethereum/go-ethereum/pull/20130
+	// for more details.
+	opt.Experimental.ReadSamplingMultiplier = -1
+
+	ds, err := dspebble.NewDatastore(dataPath(f.path), opt)
 	if err != nil {
-		return nil, fmt.Errorf("node: can't open Badger Datastore: %w", err)
+		return nil, fmt.Errorf("node: can't open Pebble Datastore: %w", err)
 	}
 
 	f.data = ds
@@ -255,68 +330,4 @@ func indexPath(base string) string {
 
 func dataPath(base string) string {
 	return filepath.Join(base, "data")
-}
-
-// constraintBadgerConfig returns BadgerDB configuration optimized for low memory usage and more frequent
-// compaction which prevents memory spikes.
-// This is particularly important for LNs with restricted memory resources.
-//
-// With the following configuration, a LN uses up to 300iB of RAM during initial sync/sampling
-// and up to 200MiB during normal operation. (on 4 core CPU, 8GiB RAM droplet)
-//
-// With the following configuration and "-tags=jemalloc", a LN uses no more than 180MiB during initial
-// sync/sampling and up to 100MiB during normal operation. (same hardware spec)
-// NOTE: To enable jemalloc, build celestia-node with "-tags=jemalloc" flag, which configures Badger to
-// use jemalloc instead of Go's default allocator.
-//
-// TODO(@Wondertan): Consider alternative less constraint configuration for FN/BN
-// TODO(@Wondertan): Consider dynamic memory allocation based on available RAM
-func constraintBadgerConfig() *dsbadger.Options {
-	opts := dsbadger.DefaultOptions // this must be copied
-	// ValueLog:
-	// 2mib default => share.Size - makes sure headers and samples are stored in value log
-	// This *tremendously* reduces the amount of memory used by the node, up to 10 times less during
-	// compaction
-	opts.ValueThreshold = share.Size
-	// make sure we don't have any limits for stored headers
-	opts.ValueLogMaxEntries = 100000000
-	// run value log GC more often to spread the work over time
-	opts.GcInterval = time.Minute * 1
-	// default 0.5 => 0.125 - makes sure value log GC is more aggressive on reclaiming disk space
-	opts.GcDiscardRatio = 0.125
-
-	// badger stores checksum for every value, but doesn't verify it by default
-	// enabling this option may allow us to see detect corrupted data
-	opts.ChecksumVerificationMode = options.OnBlockRead
-	opts.VerifyValueChecksum = true
-	// default 64mib => 0 - disable block cache
-	// most of our component maintain their own caches, so this is not needed
-	opts.BlockCacheSize = 0
-	// not much gain as it compresses the LSM only as well compression requires block cache
-	opts.Compression = options.None
-
-	// MemTables:
-	// default 64mib => 16mib - decreases memory usage and makes compaction more often
-	opts.MemTableSize = 16 << 20
-	// default 5 => 3
-	opts.NumMemtables = 3
-	// default 5 => 3
-	opts.NumLevelZeroTables = 3
-	// default 15 => 5 - this prevents memory growth on CPU constraint systems by blocking all writers
-	opts.NumLevelZeroTablesStall = 5
-
-	// Compaction:
-	// Dynamic compactor allocation
-	compactors := runtime.NumCPU() / 2
-	if compactors < 2 {
-		compactors = 2 // can't be less than 2
-	}
-	if compactors > opts.MaxLevels { // ensure there is no more compactors than db table levels
-		compactors = opts.MaxLevels
-	}
-	opts.NumCompactors = compactors
-	// makes sure badger is always compacted on shutdown
-	opts.CompactL0OnClose = true
-
-	return &opts
 }
